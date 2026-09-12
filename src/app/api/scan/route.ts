@@ -6,8 +6,8 @@ export const maxDuration = 60;
 
 const UPSTOX = "https://api.upstox.com";
 const NSE_INSTRUMENTS = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz";
-const UPSTREAM_TIMEOUT_MS = 12_000;
-const CANDLE_CONCURRENCY = 10;
+const UPSTREAM_TIMEOUT_MS = 8000;
+const CANDLE_CONCURRENCY = 12;
 
 type Instrument = {
   segment?: string;
@@ -27,7 +27,7 @@ let instrumentCache: { at: number; instruments: Instrument[] } | null = null;
 
 function token() {
   const value = process.env.UPSTOX_ANALYTICS_TOKEN;
-  if (!value) throw new Error("UPSTOX_ANALYTICS_TOKEN is not configured");
+  if (!value) throw new Error("UPSTOX_ANALYTICS_TOKEN is not configured in Vercel");
   return value;
 }
 
@@ -37,13 +37,9 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs =
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(`Upstox request timed out after ${Math.round(timeoutMs / 1000)}s`);
-    }
+    if (error instanceof Error && error.name === "AbortError") throw new Error(`Upstox request timed out after ${Math.round(timeoutMs / 1000)}s`);
     throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+  } finally { clearTimeout(timer); }
 }
 
 async function getInstruments() {
@@ -61,26 +57,17 @@ async function getInstruments() {
 }
 
 async function upstox(path: string) {
-  const response = await fetchWithTimeout(`${UPSTOX}${path}`, {
-    headers: { Accept: "application/json", Authorization: `Bearer ${token()}` },
-    cache: "no-store",
-  });
+  const response = await fetchWithTimeout(`${UPSTOX}${path}`, { headers: { Accept: "application/json", Authorization: `Bearer ${token()}` }, cache: "no-store" });
   const body = await response.text();
   if (!response.ok) throw new Error(`Upstox ${response.status}: ${body.slice(0, 300)}`);
-  try {
-    return JSON.parse(body);
-  } catch {
-    throw new Error("Upstox returned invalid JSON");
-  }
+  try { return JSON.parse(body); } catch { throw new Error("Upstox returned invalid JSON"); }
 }
 
 function isoDate(d: Date) { return d.toISOString().slice(0, 10); }
 
 function parseCandles(payload: any): Candle[] {
   const rows = payload?.data?.candles ?? [];
-  return rows.map((r: any[]) => ({
-    ts: String(r[0]), open: Number(r[1]), high: Number(r[2]), low: Number(r[3]), close: Number(r[4]), volume: Number(r[5] ?? 0), oi: r[6] == null ? undefined : Number(r[6]),
-  })).filter((c: Candle) => Number.isFinite(c.close));
+  return rows.map((r: any[]) => ({ ts: String(r[0]), open: Number(r[1]), high: Number(r[2]), low: Number(r[3]), close: Number(r[4]), volume: Number(r[5] ?? 0), oi: r[6] == null ? undefined : Number(r[6]) })).filter((c: Candle) => Number.isFinite(c.close));
 }
 
 function expiryMs(value: number | string | undefined) {
@@ -91,25 +78,18 @@ function expiryMs(value: number | string | undefined) {
 }
 
 function quoteEntry(payload: any, instrumentKey: string): Quote | null {
-  const data = payload?.data ?? {};
-  return (data[instrumentKey] ?? Object.values(data)[0] ?? null) as Quote | null;
+  return (payload?.data ?? {})[instrumentKey] ?? null;
 }
 
 function quoteNumbers(q: Quote | null) {
   if (!q) return { ltp: null, prevClose: null, oi: null, previousOi: null };
   const ohlc = q.ohlc ?? q.live_ohlc ?? {};
-  return {
-    ltp: Number(q.last_price ?? q.ltp ?? ohlc.close),
-    prevClose: Number(q.prev_close_price ?? q.cp ?? q.previous_close ?? NaN),
-    oi: Number(q.oi ?? q.open_interest ?? NaN),
-    previousOi: Number(q.previous_oi ?? q.prev_oi ?? NaN),
-  };
+  return { ltp: Number(q.last_price ?? q.ltp ?? ohlc.close), prevClose: Number(q.prev_close_price ?? q.cp ?? q.previous_close ?? NaN), oi: Number(q.oi ?? q.open_interest ?? NaN), previousOi: Number(q.previous_oi ?? q.prev_oi ?? NaN) };
 }
 
 async function fetchCandles(instrumentKey: string, from: string, to: string) {
   const encoded = encodeURIComponent(instrumentKey);
-  const payload = await upstox(`/v3/historical-candle/${encoded}/minutes/5/${to}/${from}`);
-  return parseCandles(payload);
+  return parseCandles(await upstox(`/v3/historical-candle/${encoded}/minutes/5/${to}/${from}`));
 }
 
 async function fetchQuotes(keys: string[]) {
@@ -117,24 +97,14 @@ async function fetchQuotes(keys: string[]) {
   for (let i = 0; i < keys.length; i += 500) {
     const chunk = keys.slice(i, i + 500);
     const payload = await upstox(`/v3/market-quote/quotes?instrument_key=${chunk.map(encodeURIComponent).join(",")}`);
-    for (const key of chunk) {
-      const q = quoteEntry(payload, key);
-      if (q) out.set(key, q);
-    }
+    for (const key of chunk) { const q = quoteEntry(payload, key); if (q) out.set(key, q); }
   }
   return out;
 }
 
 async function mapConcurrent<T, R>(items: T[], concurrency: number, worker: (item: T) => Promise<R>) {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  async function runner() {
-    while (true) {
-      const index = next++;
-      if (index >= items.length) return;
-      results[index] = await worker(items[index]);
-    }
-  }
+  const results: R[] = new Array(items.length); let next = 0;
+  async function runner() { while (true) { const index = next++; if (index >= items.length) return; results[index] = await worker(items[index]); } }
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, runner));
   return results;
 }
@@ -150,62 +120,47 @@ export async function GET(request: Request) {
     const today = Date.now();
     const equities = all.filter(i => i.segment === "NSE_EQ" && i.instrument_type === "EQ" && i.instrument_key);
     const futures = all.filter(i => i.segment === "NSE_FO" && i.instrument_type === "FUT" && i.underlying_key && expiryMs(i.expiry) >= today - 24 * 60 * 60 * 1000);
-
     const futureByUnderlying = new Map<string, Instrument>();
-    for (const f of futures) {
-      const current = futureByUnderlying.get(f.underlying_key!);
-      if (!current || expiryMs(f.expiry) < expiryMs(current.expiry)) futureByUnderlying.set(f.underlying_key!, f);
-    }
+    for (const f of futures) { const current = futureByUnderlying.get(f.underlying_key!); if (!current || expiryMs(f.expiry) < expiryMs(current.expiry)) futureByUnderlying.set(f.underlying_key!, f); }
 
     let universe = equities.filter(e => futureByUnderlying.has(e.instrument_key));
     if (requested.length) universe = universe.filter(e => requested.includes(String(e.trading_symbol ?? "").toUpperCase()));
     universe = universe.slice(0, requested.length ? requested.length : limit);
-
-    if (!universe.length) {
-      return Response.json({ ok: true, scanned: 0, returned: 0, generatedAt: new Date().toISOString(), results: [], errors: ["No F&O equity instruments matched the requested universe"], mode: "analytics-token-readonly" });
-    }
+    if (!universe.length) throw new Error("No NSE F&O equity universe found in Upstox instrument master");
 
     const futureKeys = universe.map(e => futureByUnderlying.get(e.instrument_key)!.instrument_key);
-    const futureQuotes = await fetchQuotes(futureKeys);
+    let futureQuotes = new Map<string, Quote>();
+    let quoteWarning = "";
+    try { futureQuotes = await fetchQuotes(futureKeys); }
+    catch (error) { quoteWarning = `F&O quote confirmation unavailable: ${error instanceof Error ? error.message : "quote request failed"}`; }
 
     const now = new Date();
-    const from = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
-    const fromDate = isoDate(from);
-    const toDate = isoDate(now);
-
+    const from = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
+    const fromDate = isoDate(from), toDate = isoDate(now);
     const errors: string[] = [];
+
     const results = (await mapConcurrent(universe, CANDLE_CONCURRENCY, async equity => {
       try {
         const candles = await fetchCandles(equity.instrument_key, fromDate, toDate);
         if (candles.length < 30) throw new Error("insufficient 5-minute candles");
         const future = futureByUnderlying.get(equity.instrument_key)!;
         const fq = quoteNumbers(futureQuotes.get(future.instrument_key) ?? null);
-        const last = [...candles].sort((a, b) => +new Date(a.ts) - +new Date(b.ts)).at(-1)!;
+        const sorted = [...candles].sort((a, b) => +new Date(a.ts) - +new Date(b.ts));
+        const last = sorted.at(-1)!;
         const futureMove = Number.isFinite(fq.ltp!) && Number.isFinite(fq.prevClose!) ? fq.ltp! - fq.prevClose! : 0;
         const oiDelta = Number.isFinite(fq.oi!) && Number.isFinite(fq.previousOi!) ? fq.oi! - fq.previousOi! : 0;
         const futureConfirm = futureMove !== 0 && ((last.close > last.open && futureMove > 0) || (last.close < last.open && futureMove < 0));
         const oiConfirm = oiDelta > 0 && futureConfirm;
-        return scorePrime({ symbol: equity.trading_symbol ?? equity.name ?? equity.instrument_key, instrumentKey: equity.instrument_key, candles, futureConfirm, oiConfirm });
+        return scorePrime({ symbol: equity.trading_symbol ?? equity.name ?? equity.instrument_key, instrumentKey: equity.instrument_key, candles: sorted, futureConfirm, oiConfirm });
       } catch (error) {
         errors.push(`${equity.trading_symbol ?? equity.instrument_key}: ${error instanceof Error ? error.message : "scan failed"}`);
         return null;
       }
-    })).filter(Boolean);
+    })).filter(Boolean) as ReturnType<typeof scorePrime>[];
 
-    results.sort((a: any, b: any) => {
-      const stateRank: Record<string, number> = { CONFIRMED: 4, SETUP: 3, WATCH: 2, NO_TRADE: 1 };
-      return (stateRank[b.state] - stateRank[a.state]) || (b.score - a.score) || (b.rvol - a.rvol);
-    });
+    results.sort((a, b) => { const stateRank: Record<string, number> = { CONFIRMED: 4, SETUP: 3, WATCH: 2, NO_TRADE: 1 }; return (stateRank[b.state] - stateRank[a.state]) || (b.score - a.score) || (b.rvol - a.rvol); });
 
-    return Response.json({
-      ok: true,
-      scanned: universe.length,
-      returned: results.length,
-      generatedAt: new Date().toISOString(),
-      results,
-      errors: errors.slice(0, 20),
-      mode: "analytics-token-readonly",
-    });
+    return Response.json({ ok: true, scanned: universe.length, returned: results.length, generatedAt: new Date().toISOString(), results, errors: [...(quoteWarning ? [quoteWarning] : []), ...errors].slice(0, 20), mode: "analytics-token-readonly" });
   } catch (error) {
     return Response.json({ ok: false, error: error instanceof Error ? error.message : "Scanner failed" }, { status: 500 });
   }
