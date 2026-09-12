@@ -8,6 +8,7 @@ const UPSTOX = "https://api.upstox.com";
 const NSE_INSTRUMENTS = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz";
 const UPSTREAM_TIMEOUT_MS = 8000;
 const CANDLE_CONCURRENCY = 12;
+const CANDLE_INTERVAL = 1;
 
 type Instrument = {
   segment?: string;
@@ -89,7 +90,7 @@ function quoteNumbers(q: Quote | null) {
 
 async function fetchCandles(instrumentKey: string, from: string, to: string) {
   const encoded = encodeURIComponent(instrumentKey);
-  return parseCandles(await upstox(`/v3/historical-candle/${encoded}/minutes/5/${to}/${from}`));
+  return parseCandles(await upstox(`/v3/historical-candle/${encoded}/minutes/${CANDLE_INTERVAL}/${to}/${from}`));
 }
 
 async function fetchQuotes(keys: string[]) {
@@ -142,7 +143,7 @@ export async function GET(request: Request) {
     const results = (await mapConcurrent(universe, CANDLE_CONCURRENCY, async equity => {
       try {
         const candles = await fetchCandles(equity.instrument_key, fromDate, toDate);
-        if (candles.length < 30) throw new Error("insufficient 5-minute candles");
+        if (candles.length < 30) throw new Error("insufficient 1-minute candles");
         const future = futureByUnderlying.get(equity.instrument_key)!;
         const fq = quoteNumbers(futureQuotes.get(future.instrument_key) ?? null);
         const sorted = [...candles].sort((a, b) => +new Date(a.ts) - +new Date(b.ts));
@@ -160,7 +161,7 @@ export async function GET(request: Request) {
 
     results.sort((a, b) => { const stateRank: Record<string, number> = { CONFIRMED: 4, SETUP: 3, WATCH: 2, NO_TRADE: 1 }; return (stateRank[b.state] - stateRank[a.state]) || (b.score - a.score) || (b.rvol - a.rvol); });
 
-    return Response.json({ ok: true, scanned: universe.length, returned: results.length, generatedAt: new Date().toISOString(), results, errors: [...(quoteWarning ? [quoteWarning] : []), ...errors].slice(0, 20), mode: "analytics-token-readonly" });
+    return Response.json({ ok: true, scanned: universe.length, returned: results.length, generatedAt: new Date().toISOString(), results, errors: [...(quoteWarning ? [quoteWarning] : []), ...errors].slice(0, 20), mode: "analytics-token-readonly", candleInterval: "1-minute" });
   } catch (error) {
     return Response.json({ ok: false, error: error instanceof Error ? error.message : "Scanner failed" }, { status: 500 });
   }
