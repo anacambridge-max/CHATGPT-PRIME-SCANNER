@@ -6,6 +6,8 @@ export const maxDuration = 60;
 
 const UPSTOX = "https://api.upstox.com";
 const NSE_INSTRUMENTS = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz";
+const UPSTREAM_TIMEOUT_MS = 12_000;
+const CANDLE_CONCURRENCY = 10;
 
 type Instrument = {
   segment?: string;
@@ -29,27 +31,47 @@ function token() {
   return value;
 }
 
+async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`Upstox request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function getInstruments() {
   if (instrumentCache && Date.now() - instrumentCache.at < 6 * 60 * 60 * 1000) return instrumentCache.instruments;
-  const response = await fetch(NSE_INSTRUMENTS, { cache: "no-store" });
+  const response = await fetchWithTimeout(NSE_INSTRUMENTS, { cache: "no-store" }, 20_000);
   if (!response.ok) throw new Error(`Instrument master failed: ${response.status}`);
   const bytes = Buffer.from(await response.arrayBuffer());
   let text: string;
   try { text = gunzipSync(bytes).toString("utf8"); } catch { text = bytes.toString("utf8"); }
   const parsed = JSON.parse(text);
   const instruments: Instrument[] = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.data) ? parsed.data : [];
+  if (!instruments.length) throw new Error("Upstox instrument master returned no instruments");
   instrumentCache = { at: Date.now(), instruments };
   return instruments;
 }
 
 async function upstox(path: string) {
-  const response = await fetch(`${UPSTOX}${path}`, {
+  const response = await fetchWithTimeout(`${UPSTOX}${path}`, {
     headers: { Accept: "application/json", Authorization: `Bearer ${token()}` },
     cache: "no-store",
   });
   const body = await response.text();
   if (!response.ok) throw new Error(`Upstox ${response.status}: ${body.slice(0, 300)}`);
-  return JSON.parse(body);
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error("Upstox returned invalid JSON");
+  }
 }
 
 function isoDate(d: Date) { return d.toISOString().slice(0, 10); }
@@ -70,7 +92,7 @@ function expiryMs(value: number | string | undefined) {
 
 function quoteEntry(payload: any, instrumentKey: string): Quote | null {
   const data = payload?.data ?? {};
-  return data[instrumentKey] ?? Object.values(data)[0] as Quote ?? null;
+  return (data[instrumentKey] ?? Object.values(data)[0] ?? null) as Quote | null;
 }
 
 function quoteNumbers(q: Quote | null) {
@@ -103,6 +125,20 @@ async function fetchQuotes(keys: string[]) {
   return out;
 }
 
+async function mapConcurrent<T, R>(items: T[], concurrency: number, worker: (item: T) => Promise<R>) {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function runner() {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, runner));
+  return results;
+}
+
 export async function GET(request: Request) {
   try {
     const url = new URL(request.url);
@@ -125,6 +161,10 @@ export async function GET(request: Request) {
     if (requested.length) universe = universe.filter(e => requested.includes(String(e.trading_symbol ?? "").toUpperCase()));
     universe = universe.slice(0, requested.length ? requested.length : limit);
 
+    if (!universe.length) {
+      return Response.json({ ok: true, scanned: 0, returned: 0, generatedAt: new Date().toISOString(), results: [], errors: ["No F&O equity instruments matched the requested universe"], mode: "analytics-token-readonly" });
+    }
+
     const futureKeys = universe.map(e => futureByUnderlying.get(e.instrument_key)!.instrument_key);
     const futureQuotes = await fetchQuotes(futureKeys);
 
@@ -133,29 +173,24 @@ export async function GET(request: Request) {
     const fromDate = isoDate(from);
     const toDate = isoDate(now);
 
-    const results = [];
     const errors: string[] = [];
-    for (let i = 0; i < universe.length; i += 4) {
-      const batch = universe.slice(i, i + 4);
-      const batchResults = await Promise.all(batch.map(async equity => {
-        try {
-          const candles = await fetchCandles(equity.instrument_key, fromDate, toDate);
-          if (candles.length < 30) throw new Error("insufficient 5-minute candles");
-          const future = futureByUnderlying.get(equity.instrument_key)!;
-          const fq = quoteNumbers(futureQuotes.get(future.instrument_key) ?? null);
-          const last = candles[candles.length - 1];
-          const futureMove = Number.isFinite(fq.ltp!) && Number.isFinite(fq.prevClose!) ? fq.ltp! - fq.prevClose! : 0;
-          const oiDelta = Number.isFinite(fq.oi!) && Number.isFinite(fq.previousOi!) ? fq.oi! - fq.previousOi! : 0;
-          const futureConfirm = futureMove !== 0 && ((last.close > (last.open) && futureMove > 0) || (last.close < last.open && futureMove < 0));
-          const oiConfirm = oiDelta > 0 && futureConfirm;
-          return scorePrime({ symbol: equity.trading_symbol ?? equity.name ?? equity.instrument_key, instrumentKey: equity.instrument_key, candles, futureConfirm, oiConfirm });
-        } catch (error) {
-          errors.push(`${equity.trading_symbol ?? equity.instrument_key}: ${error instanceof Error ? error.message : "scan failed"}`);
-          return null;
-        }
-      }));
-      results.push(...batchResults.filter(Boolean));
-    }
+    const results = (await mapConcurrent(universe, CANDLE_CONCURRENCY, async equity => {
+      try {
+        const candles = await fetchCandles(equity.instrument_key, fromDate, toDate);
+        if (candles.length < 30) throw new Error("insufficient 5-minute candles");
+        const future = futureByUnderlying.get(equity.instrument_key)!;
+        const fq = quoteNumbers(futureQuotes.get(future.instrument_key) ?? null);
+        const last = [...candles].sort((a, b) => +new Date(a.ts) - +new Date(b.ts)).at(-1)!;
+        const futureMove = Number.isFinite(fq.ltp!) && Number.isFinite(fq.prevClose!) ? fq.ltp! - fq.prevClose! : 0;
+        const oiDelta = Number.isFinite(fq.oi!) && Number.isFinite(fq.previousOi!) ? fq.oi! - fq.previousOi! : 0;
+        const futureConfirm = futureMove !== 0 && ((last.close > last.open && futureMove > 0) || (last.close < last.open && futureMove < 0));
+        const oiConfirm = oiDelta > 0 && futureConfirm;
+        return scorePrime({ symbol: equity.trading_symbol ?? equity.name ?? equity.instrument_key, instrumentKey: equity.instrument_key, candles, futureConfirm, oiConfirm });
+      } catch (error) {
+        errors.push(`${equity.trading_symbol ?? equity.instrument_key}: ${error instanceof Error ? error.message : "scan failed"}`);
+        return null;
+      }
+    })).filter(Boolean);
 
     results.sort((a: any, b: any) => {
       const stateRank: Record<string, number> = { CONFIRMED: 4, SETUP: 3, WATCH: 2, NO_TRADE: 1 };
